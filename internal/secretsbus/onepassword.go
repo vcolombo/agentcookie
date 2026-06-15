@@ -3,10 +3,12 @@ package secretsbus
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"sort"
+	"strings"
 )
 
 // OnePasswordConfig is the minimal 1Password push configuration the sink
@@ -41,12 +43,16 @@ type OnePasswordResult struct {
 }
 
 // opRunner runs the `op` CLI. Injected so tests can assert the exact argv we
-// generate and simulate create-vs-edit without a real binary.
-type opRunner func(ctx context.Context, opPath string, args, env []string) (stdout, stderr []byte, err error)
+// generate, capture stdin, and simulate create/edit/not-found without a real
+// binary. stdin is nil for commands that take no piped input.
+type opRunner func(ctx context.Context, opPath string, args []string, stdin []byte, env []string) (stdout, stderr []byte, err error)
 
-func execOpRunner(ctx context.Context, opPath string, args, env []string) ([]byte, []byte, error) {
+func execOpRunner(ctx context.Context, opPath string, args []string, stdin []byte, env []string) ([]byte, []byte, error) {
 	cmd := exec.CommandContext(ctx, opPath, args...)
 	cmd.Env = env
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
@@ -54,10 +60,25 @@ func execOpRunner(ctx context.Context, opPath string, args, env []string) ([]byt
 	return out.Bytes(), errb.Bytes(), err
 }
 
+// opField / opTemplate model the JSON item template `op` reads on stdin. Using
+// a piped template (rather than `KEY[password]=VALUE` argv assignments) keeps
+// secret VALUES out of /proc/<pid>/cmdline — the approach 1Password documents
+// for sensitive values.
+type opField struct {
+	Label string `json:"label"`
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type opTemplate struct {
+	Fields []opField `json:"fields"`
+}
+
 // PushPayload upserts the source-shipped secrets into the configured
 // 1Password vault: one item per CLI (title = the CLI name), one concealed
-// field per key (label = the env-var KEY, value = the secret). Re-runs edit
-// existing items in place, so a steady sync loop is idempotent.
+// field per key (label = the env-var KEY, value = the secret). Field values
+// travel on the `op` process's STDIN as a JSON template, never on argv.
+// Re-runs edit existing items in place, so a steady sync loop is idempotent.
 //
 // payload is the map carried in the wire envelope (envelope.Secrets). A nil
 // or empty payload is a no-op. Errors are NON-FATAL and returned for the sink
@@ -66,6 +87,15 @@ func execOpRunner(ctx context.Context, opPath string, args, env []string) ([]byt
 //
 // Consumers (e.g. a Hermes agent via its 1Password skill) read a value back
 // with `op read "op://<vault>/<cli>/<KEY>"`.
+//
+// Rotation contract / known limitation: PushPayload UPSERTS — it adds and
+// overwrites fields/items, but does NOT delete fields for keys that have
+// disappeared from the bus, nor items for CLIs that are gone. A secret removed
+// on the source therefore lingers in the vault until removed there (manually
+// or by a future reconciliation pass). Reliable orphan deletion needs `op`'s
+// field-delete syntax plus tracking which fields are agentcookie-owned vs
+// 1Password built-ins; that is deliberately deferred rather than risk mangling
+// hand-edited items. Treat the vault as add/update-only for now.
 func PushPayload(ctx context.Context, cfg OnePasswordConfig, payload map[string]map[string]string) (OnePasswordResult, []error) {
 	return pushPayload(ctx, cfg, payload, execOpRunner)
 }
@@ -94,39 +124,59 @@ func pushPayload(ctx context.Context, cfg OnePasswordConfig, payload map[string]
 			continue
 		}
 
-		// Build one concealed-field assignment per valid env-var key. The
-		// label part is "<KEY>[password]"; since KEY is a validated env-var
-		// name (no '[', ']' or '='), op parses the assignment unambiguously.
-		var assignments []string
+		// One concealed field per valid env-var key. Values go on stdin, never
+		// argv, so the field label is the only key-derived data on the command
+		// line (and labels are validated env-var names).
+		var fields []opField
 		for _, k := range sortedStringKeys(kv) {
 			if !validKeyName(k) {
 				result.SkippedKeys = append(result.SkippedKeys, cli+"/"+k)
 				continue
 			}
-			assignments = append(assignments, k+"[password]="+kv[k])
+			fields = append(fields, opField{Label: k, Type: "CONCEALED", Value: kv[k]})
 		}
-		if len(assignments) == 0 {
+		if len(fields) == 0 {
 			continue
 		}
 
-		// `op item get` exit code decides create vs edit. We only care
-		// whether the item exists, not its contents.
-		_, _, getErr := run(ctx, opPath, []string{"item", "get", cli, "--vault", cfg.Vault}, env)
-		create := getErr != nil
+		// Decide create vs edit by probing the item. CRITICAL: only treat a
+		// genuine "not found" as "create". Any other failure (auth, network,
+		// rate-limit) is ambiguous — creating then would risk a duplicate item
+		// and would silently mask the real error — so skip this CLI instead.
+		_, getStderr, getErr := run(ctx, opPath, []string{"item", "get", cli, "--vault", cfg.Vault, "--format", "json"}, nil, env)
+		var create bool
+		switch {
+		case getErr == nil:
+			create = false
+		case isOpNotFound(getStderr):
+			create = true
+		default:
+			errs = append(errs, fmt.Errorf("onepassword: probing item %q failed; skipping (not creating, to avoid a duplicate / mask the error): %w", cli, getErr))
+			continue
+		}
+
+		tmpl, err := json.Marshal(opTemplate{Fields: fields})
+		if err != nil { // unreachable for string maps, but be explicit
+			errs = append(errs, fmt.Errorf("onepassword: marshal template for %q: %w", cli, err))
+			continue
+		}
 
 		var args []string
 		if create {
-			args = append([]string{"item", "create", "--category", "API Credential", "--title", cli, "--vault", cfg.Vault}, assignments...)
+			args = []string{"item", "create", "--category", "API Credential", "--title", cli, "--vault", cfg.Vault, "-"}
 		} else {
-			args = append([]string{"item", "edit", cli, "--vault", cfg.Vault}, assignments...)
+			args = []string{"item", "edit", cli, "--vault", cfg.Vault, "-"}
 		}
 
-		if _, stderr, err := run(ctx, opPath, args, env); err != nil {
+		// NOTE: deliberately do NOT interpolate op's stderr into the error —
+		// it can echo back field labels/values. The exit error is enough to
+		// signal failure; reproduce with `op` manually for diagnosis.
+		if _, _, err := run(ctx, opPath, args, tmpl, env); err != nil {
 			verb := "edit"
 			if create {
 				verb = "create"
 			}
-			errs = append(errs, fmt.Errorf("onepassword: %s item %q: %w: %s", verb, cli, err, bytes.TrimSpace(stderr)))
+			errs = append(errs, fmt.Errorf("onepassword: %s item %q failed: %w", verb, cli, err))
 			continue
 		}
 
@@ -135,10 +185,23 @@ func pushPayload(ctx context.Context, cfg OnePasswordConfig, payload map[string]
 		} else {
 			result.ItemsUpdated++
 		}
-		result.KeysWritten += len(assignments)
+		result.KeysWritten += len(fields)
 	}
 
 	return result, errs
+}
+
+// isOpNotFound reports whether op's stderr indicates the probed item simply
+// doesn't exist (vs an auth/network/other failure). op does not expose a
+// granular exit code for this, so we match its stable human-readable markers.
+func isOpNotFound(stderr []byte) bool {
+	s := strings.ToLower(string(stderr))
+	for _, marker := range []string{"isn't an item", "not found", "no item", "doesn't exist", "could not find"} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedMapKeys(m map[string]map[string]string) []string {

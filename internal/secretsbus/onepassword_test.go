@@ -2,6 +2,7 @@ package secretsbus
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -10,37 +11,53 @@ import (
 
 // opCall records one invocation of the fake op runner.
 type opCall struct {
-	args []string
-	env  []string
+	args  []string
+	stdin []byte
+	env   []string
 }
 
-// fakeOp is a programmable op runner. notFound holds item titles for which
-// `op item get` should report "not found" (exit error → create path);
-// everything else is treated as an existing item (edit path). failArgs maps a
-// substring of the joined argv to an error the runner should return.
+// fakeOp is a programmable op runner.
+//   - notFound titles make `op item get` report a genuine "not found" (→ create).
+//   - otherErr titles make `op item get` fail with an ambiguous error (→ skip).
+//   - everything else: `op item get` succeeds (→ edit).
+//   - failWrite titles make the create/edit call fail.
 type fakeOp struct {
-	calls    []opCall
-	notFound map[string]bool
-	failOn   string // if non-empty, any call whose argv contains this substring fails
+	calls     []opCall
+	notFound  map[string]bool
+	otherErr  map[string]bool
+	failWrite map[string]bool
 }
 
-func (f *fakeOp) run(_ context.Context, _ string, args, env []string) ([]byte, []byte, error) {
-	f.calls = append(f.calls, opCall{args: slices.Clone(args), env: env})
-	joined := strings.Join(args, " ")
-	if f.failOn != "" && strings.Contains(joined, f.failOn) {
-		return nil, []byte("boom"), errors.New("op failed")
-	}
-	// `op item get <title> ...`: error when the title is in notFound.
+func (f *fakeOp) run(_ context.Context, _ string, args []string, stdin []byte, env []string) ([]byte, []byte, error) {
+	f.calls = append(f.calls, opCall{args: slices.Clone(args), stdin: slices.Clone(stdin), env: env})
+
+	// `op item get <title> ...`
 	if len(args) >= 3 && args[0] == "item" && args[1] == "get" {
-		if f.notFound[args[2]] {
-			return nil, []byte("not found"), errors.New("exit 1")
+		title := args[2]
+		if f.notFound[title] {
+			return nil, []byte(`"` + title + `" isn't an item.`), errors.New("exit 1")
+		}
+		if f.otherErr[title] {
+			return nil, []byte("error initializing client: rate limited"), errors.New("exit 1")
+		}
+		return []byte("{}"), nil, nil
+	}
+	// `op item create|edit <...>`
+	if len(args) >= 2 && args[0] == "item" && (args[1] == "create" || args[1] == "edit") {
+		title := args[2] // edit: title is positional
+		if args[1] == "create" {
+			if i := slices.Index(args, "--title"); i >= 0 && i+1 < len(args) {
+				title = args[i+1]
+			}
+		}
+		if f.failWrite[title] {
+			return nil, []byte("write failed"), errors.New("exit 1")
 		}
 	}
 	return []byte("{}"), nil, nil
 }
 
 func (f *fakeOp) lastWrite() opCall {
-	// The write (create/edit) is the call following the matching get.
 	for i := len(f.calls) - 1; i >= 0; i-- {
 		if len(f.calls[i].args) >= 2 && f.calls[i].args[0] == "item" &&
 			(f.calls[i].args[1] == "create" || f.calls[i].args[1] == "edit") {
@@ -48,6 +65,21 @@ func (f *fakeOp) lastWrite() opCall {
 		}
 	}
 	return opCall{}
+}
+
+// assertNoSecretInArgv is the security regression guard for the /proc argv
+// leak: no secret VALUE may appear in any op argument, ever.
+func assertNoSecretInArgv(t *testing.T, f *fakeOp, secrets ...string) {
+	t.Helper()
+	for _, c := range f.calls {
+		for _, a := range c.args {
+			for _, s := range secrets {
+				if strings.Contains(a, s) {
+					t.Errorf("secret %q leaked into argv %q (call %v)", s, a, c.args)
+				}
+			}
+		}
+	}
 }
 
 func TestPushPayload_CreatesNewItem(t *testing.T) {
@@ -61,33 +93,38 @@ func TestPushPayload_CreatesNewItem(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
-	if res.ItemsCreated != 1 || res.ItemsUpdated != 0 {
-		t.Errorf("got created=%d updated=%d, want 1/0", res.ItemsCreated, res.ItemsUpdated)
-	}
-	if res.KeysWritten != 2 {
-		t.Errorf("KeysWritten=%d, want 2", res.KeysWritten)
+	if res.ItemsCreated != 1 || res.ItemsUpdated != 0 || res.KeysWritten != 2 {
+		t.Errorf("got created=%d updated=%d keys=%d, want 1/0/2", res.ItemsCreated, res.ItemsUpdated, res.KeysWritten)
 	}
 
 	w := f.lastWrite()
-	wantPrefix := []string{"item", "create", "--category", "API Credential", "--title", "github-cli", "--vault", "AgentCookie"}
-	if !slices.Equal(w.args[:len(wantPrefix)], wantPrefix) {
-		t.Errorf("create argv prefix = %v, want %v", w.args[:len(wantPrefix)], wantPrefix)
+	want := []string{"item", "create", "--category", "API Credential", "--title", "github-cli", "--vault", "AgentCookie", "-"}
+	if !slices.Equal(w.args, want) {
+		t.Errorf("create argv = %v, want %v", w.args, want)
 	}
-	// Field assignments are sorted; GH_HOST before GITHUB_TOKEN.
-	wantFields := []string{"GH_HOST[password]=github.com", "GITHUB_TOKEN[password]=ghp_xyz"}
-	if !slices.Equal(w.args[len(wantPrefix):], wantFields) {
-		t.Errorf("create field assignments = %v, want %v", w.args[len(wantPrefix):], wantFields)
+	// Values ride stdin as a JSON template, sorted by label.
+	var tmpl opTemplate
+	if err := json.Unmarshal(w.stdin, &tmpl); err != nil {
+		t.Fatalf("stdin is not valid JSON: %v (%s)", err, w.stdin)
 	}
-	// Service-account token is injected into the subprocess env.
+	wantFields := []opField{
+		{Label: "GH_HOST", Type: "CONCEALED", Value: "github.com"},
+		{Label: "GITHUB_TOKEN", Type: "CONCEALED", Value: "ghp_xyz"},
+	}
+	if !slices.Equal(tmpl.Fields, wantFields) {
+		t.Errorf("stdin fields = %v, want %v", tmpl.Fields, wantFields)
+	}
+	// The security guard: the secret never appears on argv.
+	assertNoSecretInArgv(t, f, "ghp_xyz", "github.com")
 	if !slices.Contains(w.env, "OP_SERVICE_ACCOUNT_TOKEN=ops_tok") {
 		t.Errorf("env missing OP_SERVICE_ACCOUNT_TOKEN")
 	}
 }
 
 func TestPushPayload_EditsExistingItem(t *testing.T) {
-	f := &fakeOp{notFound: map[string]bool{}} // get succeeds → item exists → edit
+	f := &fakeOp{} // get succeeds → item exists → edit
 	cfg := OnePasswordConfig{Vault: "AgentCookie"}
-	payload := map[string]map[string]string{"slack-cli": {"SLACK_TOKEN": "xoxb"}}
+	payload := map[string]map[string]string{"slack-cli": {"SLACK_TOKEN": "xoxb-secret"}}
 
 	res, errs := pushPayload(context.Background(), cfg, payload, f.run)
 	if len(errs) != 0 {
@@ -97,10 +134,11 @@ func TestPushPayload_EditsExistingItem(t *testing.T) {
 		t.Errorf("got created=%d updated=%d, want 0/1", res.ItemsCreated, res.ItemsUpdated)
 	}
 	w := f.lastWrite()
-	want := []string{"item", "edit", "slack-cli", "--vault", "AgentCookie", "SLACK_TOKEN[password]=xoxb"}
+	want := []string{"item", "edit", "slack-cli", "--vault", "AgentCookie", "-"}
 	if !slices.Equal(w.args, want) {
 		t.Errorf("edit argv = %v, want %v", w.args, want)
 	}
+	assertNoSecretInArgv(t, f, "xoxb-secret")
 }
 
 func TestPushPayload_SkipsInvalidNames(t *testing.T) {
@@ -108,19 +146,13 @@ func TestPushPayload_SkipsInvalidNames(t *testing.T) {
 	cfg := OnePasswordConfig{Vault: "V"}
 	payload := map[string]map[string]string{
 		"good-cli":     {"OK_KEY": "v1", "bad key": "v2", "1BAD": "v3"},
-		"Bad_CLI_Name": {"WHATEVER": "v"}, // invalid CLI name (uppercase/underscore)
+		"Bad_CLI_Name": {"WHATEVER": "v"}, // invalid CLI name
 	}
 
 	res, errs := pushPayload(context.Background(), cfg, payload, f.run)
-
-	// Only the one valid field on the valid CLI is written.
-	if res.KeysWritten != 1 {
-		t.Errorf("KeysWritten=%d, want 1", res.KeysWritten)
+	if res.KeysWritten != 1 || res.ItemsCreated != 1 {
+		t.Errorf("got keys=%d created=%d, want 1/1", res.KeysWritten, res.ItemsCreated)
 	}
-	if res.ItemsCreated != 1 {
-		t.Errorf("ItemsCreated=%d, want 1", res.ItemsCreated)
-	}
-	// The invalid CLI produces a non-fatal error and a "<cli>/*" skip entry.
 	if !slices.Contains(res.SkippedKeys, "Bad_CLI_Name/*") {
 		t.Errorf("SkippedKeys missing Bad_CLI_Name/*: %v", res.SkippedKeys)
 	}
@@ -130,16 +162,42 @@ func TestPushPayload_SkipsInvalidNames(t *testing.T) {
 	if len(errs) != 1 {
 		t.Errorf("want 1 non-fatal error (invalid CLI), got %d: %v", len(errs), errs)
 	}
-	w := f.lastWrite()
-	want := []string{"item", "create", "--category", "API Credential", "--title", "good-cli", "--vault", "V", "OK_KEY[password]=v1"}
-	if !slices.Equal(w.args, want) {
-		t.Errorf("create argv = %v, want %v", w.args, want)
+	// Only the one valid field is in the create template.
+	var tmpl opTemplate
+	_ = json.Unmarshal(f.lastWrite().stdin, &tmpl)
+	if len(tmpl.Fields) != 1 || tmpl.Fields[0].Label != "OK_KEY" {
+		t.Errorf("template fields = %v, want only OK_KEY", tmpl.Fields)
 	}
 }
 
-func TestPushPayload_PushFailureIsNonFatalAndContinues(t *testing.T) {
-	// First CLI's create fails; second CLI must still be processed.
-	f := &fakeOp{notFound: map[string]bool{"aaa-cli": true, "bbb-cli": true}, failOn: "--title aaa-cli"}
+// TestPushPayload_FailOpenOnAmbiguousGet covers the security finding: a non-
+// "not found" probe error (auth/network/rate-limit) must NOT trigger create
+// (which would duplicate the item and mask the real error) — it skips.
+func TestPushPayload_FailOpenOnAmbiguousGet(t *testing.T) {
+	f := &fakeOp{otherErr: map[string]bool{"flaky-cli": true}}
+	cfg := OnePasswordConfig{Vault: "V"}
+	payload := map[string]map[string]string{"flaky-cli": {"A_KEY": "1"}}
+
+	res, errs := pushPayload(context.Background(), cfg, payload, f.run)
+	if res.ItemsCreated != 0 || res.ItemsUpdated != 0 {
+		t.Errorf("ambiguous get must not create/edit; got created=%d updated=%d", res.ItemsCreated, res.ItemsUpdated)
+	}
+	if len(errs) != 1 {
+		t.Fatalf("want 1 error for the ambiguous probe, got %d: %v", len(errs), errs)
+	}
+	// No create/edit call should have been issued.
+	for _, c := range f.calls {
+		if len(c.args) >= 2 && (c.args[1] == "create" || c.args[1] == "edit") {
+			t.Errorf("unexpected write call after ambiguous get: %v", c.args)
+		}
+	}
+}
+
+func TestPushPayload_WriteFailureIsNonFatalAndContinues(t *testing.T) {
+	f := &fakeOp{
+		notFound:  map[string]bool{"aaa-cli": true, "bbb-cli": true},
+		failWrite: map[string]bool{"aaa-cli": true},
+	}
 	cfg := OnePasswordConfig{Vault: "V"}
 	payload := map[string]map[string]string{
 		"aaa-cli": {"A_KEY": "1"},
@@ -152,6 +210,10 @@ func TestPushPayload_PushFailureIsNonFatalAndContinues(t *testing.T) {
 	}
 	if res.ItemsCreated != 1 {
 		t.Errorf("ItemsCreated=%d, want 1 (bbb-cli still created)", res.ItemsCreated)
+	}
+	// The error must not echo op's stderr (which could carry secret material).
+	if strings.Contains(errs[0].Error(), "write failed") {
+		t.Errorf("error leaked op stderr: %v", errs[0])
 	}
 }
 

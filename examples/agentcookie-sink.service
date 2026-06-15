@@ -32,6 +32,11 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
+# Limit /proc visibility: secret values never go on argv (they ride `op`'s
+# stdin), but this hides other processes' /proc and blunts any future argv/env
+# regression as a defense-in-depth measure.
+ProtectProc=invisible
+ProcSubset=pid
 # ~/.agentcookie is the one writable path (the cookie sidecar lands here; mount
 # it on tmpfs — see install-linux-sink.sh — so cookies stay in RAM).
 ReadWritePaths=/home/AGENTCOOKIE_USER/.agentcookie /home/AGENTCOOKIE_USER/.config/agentcookie
