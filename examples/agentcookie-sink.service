@@ -1,0 +1,46 @@
+# systemd unit for the agentcookie sink on a Linux VPS.
+#
+# Install to /etc/systemd/system/agentcookie-sink.service (system service), or
+# adapt for `systemctl --user`. scripts/install-linux-sink.sh does this for you.
+#
+# Replace AGENTCOOKIE_USER with the unprivileged account that owns the tailnet
+# membership and ~/.agentcookie. The sink needs no root once installed.
+#
+# The 1Password write-scoped service-account token is read from an 0600
+# EnvironmentFile rather than inlined here, so it never appears in `systemctl
+# show` output or this unit. Create it with:
+#   install -m600 /dev/null /etc/agentcookie/sink.env
+#   echo 'OP_SERVICE_ACCOUNT_TOKEN=ops_...' >> /etc/agentcookie/sink.env
+
+[Unit]
+Description=agentcookie sink (Chrome cookie + secrets replication target)
+# Wait for the network and Tailscale so the tailnet 100.x bind address exists.
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=AGENTCOOKIE_USER
+# Config dir defaults to ~/.config/agentcookie; set HOME so it resolves.
+Environment=HOME=/home/AGENTCOOKIE_USER
+EnvironmentFile=-/etc/agentcookie/sink.env
+ExecStart=/usr/local/bin/agentcookie sink
+Restart=on-failure
+RestartSec=5
+
+# Hardening: the sink only needs its own home dir and the tailnet socket.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Limit /proc visibility: secret values never go on argv (they ride `op`'s
+# stdin), but this hides other processes' /proc and blunts any future argv/env
+# regression as a defense-in-depth measure.
+ProtectProc=invisible
+ProcSubset=pid
+# ~/.agentcookie is the one writable path (the cookie sidecar lands here; mount
+# it on tmpfs — see install-linux-sink.sh — so cookies stay in RAM).
+ReadWritePaths=/home/AGENTCOOKIE_USER/.agentcookie /home/AGENTCOOKIE_USER/.config/agentcookie
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

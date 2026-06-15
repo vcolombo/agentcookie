@@ -1,0 +1,40 @@
+# Example sink.yaml for a HEADLESS LINUX VPS (e.g. a Hostinger box running a
+# Hermes agent in Docker). Copy to ~/.config/agentcookie/sink.yaml on the VPS.
+#
+# Linux has no macOS Keychain / Chrome Safe Storage, so this runs the sink's
+# headless "degraded mode": no Chrome SQLite write, no AppleScript. Cookies are
+# delivered as a plaintext sidecar (~/.agentcookie/cookies-plain.db) which a
+# Hermes container bind-mounts read-only; secrets are pushed into 1Password.
+# See docs/runbook-linux-vps-sink.md.
+
+listen:
+  # The VPS host's Tailscale 100.x address. The sink refuses to bind 0.0.0.0
+  # or any non-tailnet routable address (v0.12 S1 hardening). Run
+  # `tailscale ip -4` on the VPS to find it.
+  addr: 100.x.y.z:9999
+
+# Headless mode: never touch Chrome's SQLite/Keychain (neither exists on Linux).
+skip_chrome_sqlite: true
+
+# No managed Chrome on the sink — cookies go to the sidecar, not a browser here.
+cdp:
+  enabled: false
+
+# Secrets delivery via 1Password instead of plaintext ~/.agentcookie/secrets/.
+# The sink upserts one vault item per CLI (fields = the env-var keys) with the
+# `op` CLI; a Hermes agent reads them back with its 1Password skill
+# (`op read "op://AgentCookie/<cli>/<KEY>"`). When enabled, the plaintext
+# secrets.env write is suppressed, so secret values never hit the VPS disk.
+onepassword:
+  enabled: true
+  vault: AgentCookie
+  # service_account_token is OPTIONAL here. Prefer leaving it out and setting
+  # OP_SERVICE_ACCOUNT_TOKEN (write-scoped) in the systemd unit's Environment=
+  # so the token isn't stored in this file. `op` reads it from the env natively.
+  # service_account_token: ops_...
+  # op_path: /usr/bin/op   # optional; defaults to `op` on PATH
+
+peer:
+  # Hostname of the source Mac. After `agentcookie pair --as sink ...` this is
+  # the filename under ~/.config/agentcookie/keys/.
+  hostname: my-laptop.tailnet.ts.net

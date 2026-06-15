@@ -50,14 +50,39 @@ type SourceConfig struct {
 // written before this field keeps its current behavior with no migration
 // and no silent flip on a binary upgrade.
 type SinkConfig struct {
-	Listen           ListenRef   `yaml:"listen" json:"listen"`
-	Chrome           ChromeRef   `yaml:"chrome" json:"chrome"`
-	Peer             PeerRef     `yaml:"peer,omitempty" json:"peer,omitempty"`
-	Security         SecurityRef `yaml:"security,omitempty" json:"security,omitempty"`
-	SkipChromeSQLite bool        `yaml:"skip_chrome_sqlite,omitempty" json:"skip_chrome_sqlite,omitempty"`
-	CDP              CDPRef      `yaml:"cdp,omitempty" json:"cdp,omitempty"`
-	Cmux             CmuxRef     `yaml:"cmux,omitempty" json:"cmux,omitempty"`
-	Delivery         string      `yaml:"delivery,omitempty" json:"delivery,omitempty"`
+	Listen           ListenRef      `yaml:"listen" json:"listen"`
+	Chrome           ChromeRef      `yaml:"chrome" json:"chrome"`
+	Peer             PeerRef        `yaml:"peer,omitempty" json:"peer,omitempty"`
+	Security         SecurityRef    `yaml:"security,omitempty" json:"security,omitempty"`
+	SkipChromeSQLite bool           `yaml:"skip_chrome_sqlite,omitempty" json:"skip_chrome_sqlite,omitempty"`
+	CDP              CDPRef         `yaml:"cdp,omitempty" json:"cdp,omitempty"`
+	Cmux             CmuxRef        `yaml:"cmux,omitempty" json:"cmux,omitempty"`
+	OnePassword      OnePasswordRef `yaml:"onepassword,omitempty" json:"onepassword,omitempty"`
+	Delivery         string         `yaml:"delivery,omitempty" json:"delivery,omitempty"`
+}
+
+// OnePasswordRef configures the 1Password secrets-delivery surface used by
+// the Linux VPS sink. When Enabled, the sink pushes each synced secrets-bus
+// key into a 1Password vault via the `op` CLI (idempotent item create/edit)
+// instead of writing plaintext ~/.agentcookie/secrets/<cli>/secrets.env. A
+// Hermes agent on the same box reads them back on demand through its official
+// 1Password skill (`op read`/`op run`), so secret values never touch the
+// sink's disk.
+//
+// omitempty keeps a pre-1Password sink.yaml valid with the surface off: an
+// absent block decodes to Enabled=false and the sink keeps writing secrets.env.
+type OnePasswordRef struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Vault is the target 1Password vault name or ID the sink writes items
+	// into (and Hermes reads from). Required when Enabled.
+	Vault string `yaml:"vault,omitempty" json:"vault,omitempty"`
+	// ServiceAccountToken is the write-scoped 1Password service-account
+	// token. Optional: when empty the sink relies on OP_SERVICE_ACCOUNT_TOKEN
+	// already present in its process environment (the systemd unit's
+	// Environment=), which `op` reads natively. Never marshaled to JSON.
+	ServiceAccountToken string `yaml:"service_account_token,omitempty" json:"-"`
+	// OpPath overrides the `op` CLI location. Empty resolves `op` on PATH.
+	OpPath string `yaml:"op_path,omitempty" json:"op_path,omitempty"`
 }
 
 // CmuxRef configures the cmux cookie-delivery surface (a fourth surface
@@ -246,6 +271,12 @@ func LoadSink(dir string) (*SinkConfig, error) {
 	}
 	if cfg.Cmux.CmuxPath != "" {
 		cfg.Cmux.CmuxPath = ExpandTilde(cfg.Cmux.CmuxPath)
+	}
+	if cfg.OnePassword.Enabled && cfg.OnePassword.Vault == "" {
+		return nil, fmt.Errorf("%s: onepassword.vault is required when onepassword.enabled is true", path)
+	}
+	if cfg.OnePassword.OpPath != "" {
+		cfg.OnePassword.OpPath = ExpandTilde(cfg.OnePassword.OpPath)
 	}
 	return &cfg, nil
 }

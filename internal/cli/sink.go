@@ -309,14 +309,31 @@ func newSinkMux(
 		// twin appears alongside the plaintext. R12 regression guard:
 		// when envelope.Secrets is empty/nil this branch is a no-op.
 		if len(envelope.Secrets) > 0 {
-			home, _ := os.UserHomeDir()
-			sealingEnabled := keystore.MasterKeyExists()
-			secResult, secErrs := secretsbus.WritePayload(home, envelope.Secrets, sealingEnabled)
-			for _, e := range secErrs {
-				fmt.Fprintf(os.Stderr, "agentcookie sink: secrets-bus: %v\n", e)
+			if cfg.OnePassword.Enabled {
+				// Linux/VPS path: push secrets into a 1Password vault via
+				// `op` instead of writing plaintext secrets.env to disk, so
+				// secret values never land on the sink's filesystem. A Hermes
+				// agent reads them back on demand with its 1Password skill.
+				opResult, opErrs := secretsbus.PushPayload(r.Context(), secretsbus.OnePasswordConfig{
+					Vault:               cfg.OnePassword.Vault,
+					ServiceAccountToken: cfg.OnePassword.ServiceAccountToken,
+					OpPath:              cfg.OnePassword.OpPath,
+				}, envelope.Secrets)
+				for _, e := range opErrs {
+					fmt.Fprintf(os.Stderr, "agentcookie sink: 1password: %v\n", e)
+				}
+				fmt.Fprintf(os.Stderr, "agentcookie sink: 1password pushed %d created, %d updated, %d key(s), %d skipped\n",
+					opResult.ItemsCreated, opResult.ItemsUpdated, opResult.KeysWritten, len(opResult.SkippedKeys))
+			} else {
+				home, _ := os.UserHomeDir()
+				sealingEnabled := keystore.MasterKeyExists()
+				secResult, secErrs := secretsbus.WritePayload(home, envelope.Secrets, sealingEnabled)
+				for _, e := range secErrs {
+					fmt.Fprintf(os.Stderr, "agentcookie sink: secrets-bus: %v\n", e)
+				}
+				fmt.Fprintf(os.Stderr, "agentcookie sink: secrets-bus wrote %d cli(s), %d key(s), %d sealed, %d file(s) materialized\n",
+					secResult.CLIsWritten, secResult.KeysWritten, secResult.SealedWritten, secResult.FilesMaterialized)
 			}
-			fmt.Fprintf(os.Stderr, "agentcookie sink: secrets-bus wrote %d cli(s), %d key(s), %d sealed, %d file(s) materialized\n",
-				secResult.CLIsWritten, secResult.KeysWritten, secResult.SealedWritten, secResult.FilesMaterialized)
 		}
 
 		_ = stateWriter.Save(sinkState)
