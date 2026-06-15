@@ -33,7 +33,7 @@ ifeq ($(GOBIN),)
 GOBIN := $(shell go env GOPATH)/bin
 endif
 
-.PHONY: all build install sign notarize release verify test vet clean
+.PHONY: all build build-linux install sign notarize release verify test vet clean
 
 all: build sign
 
@@ -42,6 +42,12 @@ release: build sign notarize
 build:
 	@mkdir -p $(BIN_DIR)
 	go build -o $(BINARY) $(PKG)
+
+# Cross-build the Linux sink binary (CGO, via Docker) for a Linux VPS.
+# The cookie sidecar needs go-sqlite3 (CGO), so this builds inside the
+# pinned golang image. Override the arch with `make build-linux ARCH=arm64`.
+build-linux:
+	ARCH=$(ARCH) scripts/build-linux-sink.sh
 
 # Install to $(GOBIN)/agentcookie and sign in place so steady-state
 # `make install` produces a signed binary with the same designated

@@ -221,6 +221,99 @@ security:
 	})
 }
 
+// TestExampleSinkLinuxParses guards that the shipped examples/sink-linux.yaml
+// stays valid under the strict (KnownFields) decoder — a stale example is a
+// support trap. It copies the example in as sink.yaml and loads it.
+func TestExampleSinkLinuxParses(t *testing.T) {
+	src := filepath.Join("..", "..", "examples", "sink-linux.yaml")
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read %s: %v", src, err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sink.yaml"), data, 0o600); err != nil {
+		t.Fatalf("write sink.yaml: %v", err)
+	}
+	cfg, err := LoadSink(dir)
+	if err != nil {
+		t.Fatalf("LoadSink(example sink-linux.yaml): %v", err)
+	}
+	if !cfg.SkipChromeSQLite {
+		t.Error("example should set skip_chrome_sqlite: true")
+	}
+	if !cfg.OnePassword.Enabled || cfg.OnePassword.Vault == "" {
+		t.Errorf("example should enable onepassword with a vault, got %+v", cfg.OnePassword)
+	}
+}
+
+// TestLoadSinkOnePassword covers the Linux-VPS 1Password secrets surface.
+// Round-trips the onepassword block through YAML, checks that Enabled
+// without a vault is a config error, and that absence defaults to off.
+func TestLoadSinkOnePassword(t *testing.T) {
+	t.Run("enabled with vault round-trips", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "sink.yaml", `
+listen:
+  addr: 100.80.229.80:9999
+skip_chrome_sqlite: true
+onepassword:
+  enabled: true
+  vault: AgentCookie
+  op_path: ~/bin/op
+security:
+  shared_secret: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+`)
+		cfg, err := LoadSink(dir)
+		if err != nil {
+			t.Fatalf("LoadSink: %v", err)
+		}
+		if !cfg.OnePassword.Enabled {
+			t.Errorf("OnePassword.Enabled: got false, want true")
+		}
+		if cfg.OnePassword.Vault != "AgentCookie" {
+			t.Errorf("OnePassword.Vault: got %q, want AgentCookie", cfg.OnePassword.Vault)
+		}
+		home, _ := os.UserHomeDir()
+		if want := filepath.Join(home, "bin", "op"); cfg.OnePassword.OpPath != want {
+			t.Errorf("OnePassword.OpPath: got %q, want %q (tilde-expanded)", cfg.OnePassword.OpPath, want)
+		}
+	})
+
+	t.Run("enabled without vault is an error", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "sink.yaml", `
+listen:
+  addr: 100.80.229.80:9999
+onepassword:
+  enabled: true
+security:
+  shared_secret: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+`)
+		if _, err := LoadSink(dir); err == nil {
+			t.Fatal("expected error for onepassword.enabled without vault, got nil")
+		} else if !strings.Contains(err.Error(), "onepassword.vault is required") {
+			t.Errorf("error should name onepassword.vault, got %v", err)
+		}
+	})
+
+	t.Run("absent block defaults to off", func(t *testing.T) {
+		dir := t.TempDir()
+		writeFile(t, dir, "sink.yaml", `
+listen:
+  addr: 100.80.229.80:9999
+security:
+  shared_secret: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+`)
+		cfg, err := LoadSink(dir)
+		if err != nil {
+			t.Fatalf("LoadSink: %v", err)
+		}
+		if cfg.OnePassword.Enabled {
+			t.Errorf("OnePassword.Enabled: got true, want false (default off)")
+		}
+	})
+}
+
 // TestLoadSinkDeliveryMarker covers the v0.13 universal-cookie-delivery
 // marker. The delivery field round-trips through YAML so a later doctor
 // unit can report intent, and its absence keeps current behavior (no

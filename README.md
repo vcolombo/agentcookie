@@ -270,6 +270,7 @@ In short: DBSC narrows one corner of the web (today, mostly Google) and agentcoo
 | [Threat model](docs/threat-model.md) | what agentcookie does and does not protect against |
 | [FAQ](docs/faq.md) | common questions |
 | [Headless quickstart](docs/quickstart-beta.md) | SSH-only install on a headless second Mac |
+| [Linux VPS sink runbook](docs/runbook-linux-vps-sink.md) | run the sink on a Linux VPS feeding a Hermes Docker agent; cookies via tmpfs sidecar, secrets via 1Password |
 | [v0.13 one-password keychain runbook](docs/runbook-v0.13-one-password-keychain.md) | universal delivery: the one-password Safe Storage partition open, the duplicate-item race + converge, and the unsigned-CGO boundary |
 | [v0.10 keychain runbook](docs/runbook-v0.10-keychain-access.md) | legacy sink Keychain ACL setup (superseded by v0.13 for the grant path) |
 | [agent-sync runbook](docs/runbook-agent-sync.md) | log browser-use / agent-browser into your sites via live CDP injection; why cold profiles / storage_state fail |

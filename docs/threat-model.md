@@ -44,6 +44,16 @@ agentcookie trusts:
 - Cookie value tampering by the source. The source is authoritative; if the source machine pushes cookies for a non-blocklisted domain, the sink writes them. There is no separate authorization layer per domain.
 - Local processes while an `agent-sync` debug endpoint is open. `agent-sync` runs a dedicated Chrome with a Chrome DevTools Protocol port bound to `127.0.0.1` only. While it is running, **any process running as the same user can connect to that port** and read or drive the owned browser (including its injected cookies) -- which is exactly why Chrome 136 stopped honoring `--remote-debugging-port` on the default profile. Treat a running `agent-sync` as a same-user trust boundary: run it while you are driving agent browsers and stop it (Ctrl-C) when you are done. It never opens the port on a non-loopback interface, and it uses its own profile dir so the port never exposes your everyday Chrome's session. Device-bound (DBSC) cookies are not injected and cannot transfer regardless.
 
+## Linux VPS sink + 1Password
+
+Running the sink on a Linux VPS (see [runbook-linux-vps-sink.md](runbook-linux-vps-sink.md)) changes the trust model from the all-Mac default, in both directions. Be explicit about it before adopting.
+
+- **No Keychain, no at-rest sealing.** Linux has no macOS Safe Storage, so the sink runs in `skip_chrome_sqlite` mode and the cookie sidecar is **plaintext**. The `agc1:` sealing path is unavailable. Mitigation: the install mounts `~/.agentcookie/` on **tmpfs**, so the plaintext cookie DB lives only in RAM and is gone on reboot (re-synced on the next push). It is never written to persistent disk. The cookie file is bind-mounted **read-only** into the Hermes container.
+- **Secrets do not touch the disk.** With the 1Password surface enabled, the sink pushes secret values into a 1Password vault via `op` (in memory) instead of writing `secrets.env`, and Hermes reads them back on demand via its 1Password skill (`op read`/`op run`, also in memory). So unlike Hermes's Bitwarden secret-source path — which deliberately writes a plaintext value cache to `~/.hermes/cache/` — there is **no plaintext secret cache** anywhere on the VPS.
+- **The persistent secrets on the box** are 1Password service-account tokens: a **read-scoped** `OP_SERVICE_ACCOUNT_TOKEN` in the Hermes container's `~/.hermes/.env`, and a **write-scoped** token in the sink's `/etc/agentcookie/sink.env` (mode 0600). Both are vault-scoped, non-interactive, and **revocable/rotatable centrally** in the 1Password web app (where human access is 2FA-gated). A stolen read token exposes only the one vault; a stolen write token can overwrite that vault's items but cannot read other vaults. Scope each to the single `AgentCookie` vault.
+- **The VPS is third-party hardware.** Anyone with root on the VPS, or the hosting provider, can read process memory (the in-RAM cookie sidecar, the tokens, Hermes's fetched secrets) and the service-account tokens at rest. tmpfs and in-memory secrets defend against *disk* capture (snapshots, backups, decommissioned drives), not against a live-root adversary. This is a real step down from the all-Mac posture; treat the VPS as semi-trusted, scope the tokens tightly, and keep the tailnet ACL narrow.
+- **Transport is unchanged.** Tailscale on the VPS host gives the sink a 100.x bind address, so the AES-256-GCM-over-WireGuard channel and the pairing-derived per-peer key work exactly as on a Mac sink. No public listener, no TLS to manage. Keep a tailnet ACL scoping who can reach `:9999`.
+
 ## Cryptographic specifics
 
 - Cookie at rest in Chrome's own SQLite on each machine: Chrome's existing scheme (AES-128-CBC with per-machine Safe Storage key, PBKDF2-SHA1, salt `saltysalt`, 1003 iters, IV = 16 spaces, v10 prefix). agentcookie reads with the local key and re-encrypts with the destination's local key.
@@ -56,7 +66,7 @@ agentcookie trusts:
 
 - v0.12 (this release) closes every Critical and High finding from the v0.11 threat survey except S5 (plaintext sidecar at rest), which stays open in the default install because turning sealing on requires the PP CLI consumer-side (U12) to ship in cli-printing-press first. Operators who only run agentcookie-controlled binaries on the sink can pass `wizard set-keychain-access --enable-sealing` to opt in; the on-disk sidecar and adapter session files become sealed and S5 closes for them.
 - v0.13 (planned) will migrate the paired key keystore at `~/.config/agentcookie/keys/<peer>.json` into the macOS Keychain, closing the last on-disk plaintext credential.
-- v0.14 or later may add Linux sink support, a Chrome extension on the sink, and one-to-many fan-out. Each of those reopens parts of this document; re-read before adopting.
+- v0.14 or later may add Linux sink support, a Chrome extension on the sink, and one-to-many fan-out. Each of those reopens parts of this document; re-read before adopting. The Linux VPS sink + 1Password path (above) is the first of these — its trust model differs from the all-Mac default.
 
 ## Reporting issues
 
